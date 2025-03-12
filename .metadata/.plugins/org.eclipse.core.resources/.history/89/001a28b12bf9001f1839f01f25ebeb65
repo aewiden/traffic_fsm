@@ -1,0 +1,213 @@
+#include <stdio.h>      /* getchar, printf */
+#include <stdlib.h>     /* strtod */
+#include <stdbool.h>    /* type bool */
+#include <unistd.h>     /* sleep */
+#include <string.h>
+#include "xparameters.h"
+#include "xuartps.h"
+#include "xil_exception.h"
+#include "xil_printf.h"
+#include "xscugic.h"
+#include "gic.h"
+#include "platform.h"
+#include "io.h"
+#include "led.h"
+#include "adc.h"
+#include "servo.h"
+#include "ttc.h"
+#include "xtmrctr.h"    /* AXI Timer interface */
+#include "xgpio.h"      /* axi gpio interface */
+
+// Global variables
+static TrafficState state = GREEN;
+static bool pedestrian_requested_0 = false;
+static bool pedestrian_requested_2 = false;
+static bool train_approaching = false;
+static bool maintenance_mode = false;
+static int timer_count = 0;
+static bool done;
+
+enum TrafficState {
+	GREEN,
+	YELLOW,
+	RED,
+	PED_WAIT,
+	PED_X,
+	TRAIN_APPROACH,
+	TRAIN_PASS,
+	TRAIN_DONE,
+	MAINTENANCE
+};
+// Function to print current state
+void print_state() {
+    switch (state) {
+        case GREEN: printf("[STATE] GREEN - Traffic flowing\n"); break;
+        case YELLOW: printf("[STATE] YELLOW - Prepare to stop\n"); break;
+        case RED: printf("[STATE] RED - Traffic stopped\n"); break;
+        case PED_X: printf("[STATE] PED_X - Pedestrians crossing\n"); break;
+        case TRAIN_APPROACH: printf("[STATE] TRAIN_APPROACH - Train approaching, closing gate\n"); break;
+        case TRAIN_PASS: printf("[STATE] TRAIN_PASS - Train passing, gate closed\n"); break;
+        case TRAIN_DONE: printf("[STATE] TRAIN_DONE - Train passed, opening gate\n"); break;
+        case MAINTENANCE: printf("[STATE] MAINTENANCE - Manual control enabled\n"); break;
+    }
+}
+
+// Function to update LED display using correct RGB LED control
+void update_lights() {
+    led_set(RED, LED_OFF);
+    led_set(YELLOW, LED_OFF);
+    led_set(GREEN, LED_OFF);
+    
+    if (maintenance_mode) {
+        led4_on(); // Blink LED4 for maintenance mode
+        led_set(BLUE, LED_ON);
+    } else {
+        switch (state) {
+            case GREEN: led_set(GREEN, LED_ON); break;
+            case YELLOW: led_set(YELLOW, LED_ON); break;
+            case RED: led_set(RED, LED_ON); break;
+            case PED_X:
+                led_set(RED, LED_ON);
+                if (pedestrian_requested_0) led_set(0, LED_ON);
+                if (pedestrian_requested_2) led_set(3, LED_ON);
+                break;
+            case TRAIN_APPROACH: led_set(RED, LED_ON); break;
+            case TRAIN_PASS: led_set(RED, LED_ON); break;
+            case TRAIN_DONE: led_set(RED, LED_ON); break;
+            default: break;
+        }
+    }
+    print_state();
+}
+
+// Timer callback (called every 0.1s)
+void ttc_callback() {
+    if (maintenance_mode) {
+        led_toggle(BLUE); // Blink LED4 in maintenance mode
+        return;
+    }
+    
+    timer_count++;
+    
+    switch (state) {
+        case GREEN:
+            if (timer_count >= 100) { // 10s
+                state = (pedestrian_requested_0 || pedestrian_requested_2) ? RED : YELLOW;
+                timer_count = 0;
+            }
+            break;
+        case YELLOW:
+            if (timer_count >= 30) { // 3s
+                state = RED;
+                timer_count = 0;
+            }
+            break;
+        case RED:
+            if ((pedestrian_requested_0 || pedestrian_requested_2) && timer_count >= 30) { // 3s
+                state = PED_X;
+                timer_count = 0;
+            } else if (timer_count >= 30) {
+                state = GREEN;
+                timer_count = 0;
+            }
+            break;
+        case PED_X:
+            if (timer_count >= 100) { // 10s
+                state = RED;
+                timer_count = 0;
+                pedestrian_requested_0 = false;
+                pedestrian_requested_2 = false;
+                led_set(0, LED_OFF);
+                led_set(3, LED_OFF);
+            }
+            break;
+        case TRAIN_APPROACH:
+            servo_set(5.5); // Close gate
+            state = TRAIN_PASS;
+            break;
+        case TRAIN_PASS:
+            if (!train_approaching) {
+                state = TRAIN_DONE;
+            }
+            break;
+        case TRAIN_DONE:
+            if (timer_count >= 100) { // 10s delay
+                servo_set(10.25); // Open gate
+                state = GREEN;
+                timer_count = 0;
+            }
+            break;
+    }
+    update_lights();
+}
+
+// Button callback (Pedestrian request)
+void btn_callback(u32 btn) {
+    if (!maintenance_mode && state == GREEN) {
+        if (btn & (1 << 0)) {
+            pedestrian_requested_0 = true;
+        }
+        if (btn & (1 << 2)) {
+            pedestrian_requested_2 = true;
+        }
+        if (btn & (1 << 3)) {
+            done = true;
+        }
+    }
+}
+
+// Switch callback (Train arrival & Maintenance Mode)
+void sw_callback(u32 sw) {
+    if (sw & (1 << 0)) {
+        train_approaching = true;
+        state = TRAIN_APPROACH;
+    }
+    if (sw & (1 << 1)) {
+        maintenance_mode = !maintenance_mode;
+    }
+}
+
+int main() {
+    init_platform();
+    done = FALSE;
+    
+    printf("\n[hello]\n");
+    if (gic_init() != XST_SUCCESS) {
+        return -1;
+    }
+    led_init();
+    led4_init(); // Initialize LED4
+    led_set(ALL, LED_OFF);
+    servo_init();
+    io_btn_init(btn_callback);
+    io_sw_init(sw_callback);
+    ttc_init(10, &ttc_callback); // 10 Hz timing
+    setvbuf(stdin, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    ttc_start();
+    update_lights();
+    TrafficState state = GREEN;
+    
+    while (!done) {
+        if (maintenance_mode) {
+            double manual_gate = adc_get_pot() * (10.25 - 5.5) + 5.5;
+            servo_set(manual_gate);
+        }
+        sleep(0.5);
+    }
+    printf("\n[done]\n");
+   
+    // Cleanup
+    led_set(ALL, LED_OFF);
+    led4_off();
+
+    ttc_stop();
+    ttc_close();
+
+    io_btn_close();
+    io_sw_close();
+    gic_close();
+    cleanup_platform();
+    return 0;
+}

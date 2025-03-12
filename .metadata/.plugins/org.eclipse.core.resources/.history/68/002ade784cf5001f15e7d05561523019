@@ -1,0 +1,65 @@
+/**********************************************************
+ * substation.h
+ *
+ * Defines the message structures (PING, UPDATE, etc.)
+ * and declares the poll_substation_status() function
+ * that the main code can call to learn the remote status.
+ *
+ **********************************************************/
+#ifndef SUBSTATION_H
+#define SUBSTATION_H
+
+#include <stdbool.h>
+
+/* message types */
+#define PING   1
+#define UPDATE 2
+#define CLASS_SIZE_MAX 30
+
+/* Data structures from substation.c */
+typedef struct {
+    int type;  /* PING or UPDATE */
+    int id;
+} Ping_t;
+
+typedef struct {
+    int type;  /* must be UPDATE when we do substation poll */
+    int id;    /* 0 for poll, or crossing ID*/
+    int value; /* not used for polling, or can put 0 */
+} Update_req_t;
+
+typedef struct {
+    int type;    /* UPDATE */
+    int id;      /* not always used, might be 0 or your ID */
+    int average; /* the average for the entire class? */
+    int values[CLASS_SIZE_MAX]; /* the status array for each crossing ID */
+} Update_resp_t;
+
+typedef union {
+    Ping_t pingmsg;
+    Update_req_t  reqmsg;
+    Update_resp_t respmsg;
+} Msg_t;
+
+/**
+ * poll_substation_status
+ *
+ * Sends an UPDATE(id=0,value=0) message via UART0 (WiFly),
+ * reads the response, and if successful, sets these booleans:
+ *
+ *  - trainArriving (true if substation says "train arriving")
+ *  - maintenanceOn (true if substation requests maintenance ON)
+ *  - maintenanceOff (true if substation requests maintenance OFF)
+ *
+ * You decide how the substation encodes these commands, e.g.:
+ *   1 => train arriving
+ *   2 => maintenance ON
+ *   3 => maintenance OFF
+ *   else => normal
+ *
+ */
+void poll_substation_status(bool *trainArriving,
+                            bool *maintenanceOn,
+                            bool *maintenanceOff);
+
+#endif

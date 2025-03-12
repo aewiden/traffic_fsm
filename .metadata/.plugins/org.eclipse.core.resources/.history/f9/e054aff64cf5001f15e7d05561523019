@@ -1,0 +1,81 @@
+/**********************************************************
+ * substation_poll.c
+ *
+ * Implementation of poll_substation_status() from substation.h
+ * for WiFly approach. We assume you have a global
+ * or file-scope XUartPs instance that references UART0
+ * (the one connected to the WiFly).
+ **********************************************************/
+#include "substation.h"
+#include "xuartps.h"
+#include "xil_printf.h"
+#include "sleep.h"
+#include <string.h>
+
+extern XUartPs UartInst0;
+
+#define MY_CROSSING_ID  28
+
+void poll_substation_status(bool *trainArriving,
+                            bool *maintenanceOn,
+                            bool *maintenanceOff)
+{
+    // Clear the booleans each time
+    *trainArriving  = false;
+    *maintenanceOn  = false;
+    *maintenanceOff = false;
+
+    // Build the request
+    Msg_t txMsg;
+    memset(&txMsg, 0, sizeof(Msg_t));
+    txMsg.reqmsg.type  = UPDATE;
+    txMsg.reqmsg.id    = 0;      // required for "poll"
+    txMsg.reqmsg.value = 0;      // typically 0
+
+    int bytesToSend = sizeof(Update_req_t);
+    int sent = XUartPs_Send(&UartInst0, (u8*)&txMsg.reqmsg, bytesToSend);
+
+    usleep(50000);
+
+    Msg_t rxMsg;
+    memset(&rxMsg, 0, sizeof(Msg_t));
+    int bytesRcvd = 0;
+    int needed    = sizeof(Update_resp_t);
+
+    // read until we have all the bytes
+    while (bytesRcvd < needed) {
+        int chunk = XUartPs_Recv(&UartInst0, ((u8*)&rxMsg.respmsg)+bytesRcvd, needed-bytesRcvd);
+        if (chunk <= 0) {
+            // no more data available, break or wait
+            break;
+        }
+        bytesRcvd += chunk;
+    }
+
+    // If complete response
+    if (bytesRcvd == sizeof(Update_resp_t) && rxMsg.respmsg.type == UPDATE) {
+        // interpret substation's array
+        int val = rxMsg.respmsg.values[MY_CROSSING_ID];
+
+        switch(val) {
+          case 1:
+             *trainArriving = true;
+             xil_printf("[SubstationPoll] Train arriving indicated.\r\n");
+             break;
+          case 2:
+             *maintenanceOn = true;
+             xil_printf("[SubstationPoll] Maintenance ON indicated.\r\n");
+             break;
+          case 3:
+             *maintenanceOff = true;
+             xil_printf("[SubstationPoll] Maintenance OFF indicated.\r\n");
+             break;
+          default:
+             // 0 => normal/clear, or anything else
+             break;
+        }
+    } else {
+        // either incomplete message or not an UPDATE type
+        // xil_printf("poll_substation: no valid response.\r\n");
+    }
+}

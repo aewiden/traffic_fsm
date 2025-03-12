@@ -1,0 +1,528 @@
+/**************************************************************
+ * main.c
+ * Full example combining:
+ *   - Finite State Machine for railway crossing
+ *   - Servo gate control
+ *   - RGB + Yellow + Blue LEDs for traffic & maintenance
+ *   - Switches for train & maintenance
+ *   - Pedestrian buttons (two)
+ *   - Potentiometer for manual gate in maintenance
+ *   - Timings:
+ *       - 10 seconds min traffic flow (instead of 3 mins)
+ *       - 10 seconds pedestrian crossing (instead of 30s or 20s)
+ *       - 3-second color intervals for traffic lights
+ *       - 1-second flash of blue LED in maintenance
+ *       - All timed to 1/10 s accuracy
+ *   - Substation polling at 10 Hz (UPDATE id=0) over Wi-Fi (UART0)
+ *     so substation can signal train or start/stop maintenance.
+ *
+ **************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include "xparameters.h"
+#include "xuartps.h"
+#include "xil_printf.h"
+#include "xgpio.h"
+#include "xil_exception.h"
+#include "sleep.h"
+
+#include "gic.h"
+#include "platform.h"
+#include "servo.h"
+#include "led.h"
+#include "adc.h"
+#include "io.h"
+#include "substation.h"
+
+/**************************************************************
+ * Substation message definitions
+ **************************************************************/
+#define PING   1
+#define UPDATE 2
+#define CLASS_SIZE_MAX 30
+
+/**************************************************************
+ * FSM States
+ **************************************************************/
+typedef enum {
+    ST_TRAFFIC_FLOW = 0,
+    ST_PEDESTRIAN_WAIT,
+    ST_PEDESTRIAN_CROSSING,
+    ST_TRAIN_APPROACH,
+    ST_TRAIN_PASSING,
+    ST_POST_TRAIN_HOLD,
+    ST_MAINTENANCE_CLOSING,
+    ST_MAINTENANCE_MODE,
+    ST_MAINTENANCE_EXIT
+} fsm_state_t;
+
+/**************************************************************
+ * Timings
+ * 100ms loop => 1/10 second.
+ *   - 10 seconds for traffic min flow
+ *   - 10 seconds for pedestrian crossing
+ *   - 3-second intervals for traffic lights
+ *   - 1-second intervals for blue LED flash
+ **************************************************************/
+#define TICK_PERIOD_MS          100
+#define TICKS_PER_SECOND        (1000 / TICK_PERIOD_MS)
+
+#define TRAFFIC_MIN_FLOW_TICKS  (10  * TICKS_PER_SECOND) // 10 s
+#define PEDESTRIAN_TIME_TICKS   (10  * TICKS_PER_SECOND) // 10 s
+#define POST_TRAIN_HOLD_TICKS   (10  * TICKS_PER_SECOND) // 10 s wait
+#define BLUE_FLASH_HALF_PERIOD  (10  * TICKS_PER_SECOND) // 1s on/off => 10 ticks
+
+// Traffic lights cycle every 3 seconds
+/**************************************************************
+ * Gate angles
+ **************************************************************/
+#define GATE_UP_ANGLE   0.0
+#define GATE_DOWN_ANGLE 90.0
+
+/**************************************************************
+ * Global or static variables
+ **************************************************************/
+static fsm_state_t currentState = ST_TRAFFIC_FLOW;
+
+// Counters
+static int trafficFlowCounter  = 0;
+static int pedestrianCounter   = 0;
+static int postTrainCounter    = 0;
+static int blueFlashCounter    = 0;
+
+// Flags
+static bool pedRequestFlag     = false;
+
+// Local input signals
+static bool trainArrivingSwitch   = false;  // local switch or substation
+static bool maintenanceKeySwitch  = false;  // local switch or substation
+static bool remoteMaintenanceOffFlag = false;
+static bool pedBtn1 = false;
+static bool pedBtn2 = false;
+
+#define MY_CROSSING_ID  26
+static XUartPs UartInst0;  // WiFly
+static XUartPs UartInst1;  // Console
+static XGpio gpioIn;
+#define GPIO_IN_DEVICE_ID  XPAR_AXI_GPIO_0_DEVICE_ID
+#define GPIO_IN_CHANNEL    1
+
+
+static void hardware_init(void);
+static void read_inputs(void);
+static void update_fsm(void);
+static void update_outputs(void);
+static void traffic_light_sequence(void);
+
+static void parse_substation_value(int val); // interpret substation array entry
+
+int main(void)
+{
+    init_platform();
+
+    if (gic_init() != XST_SUCCESS) {
+        xil_printf("GIC init failure!\n");
+        return -1;
+    }
+
+    hardware_init();
+
+    xil_printf("[Railway Crossing FSM] Start\n");
+
+    // Start with gate up
+    servo_set(GATE_UP_ANGLE);
+
+    // Main loop => 10Hz => 100ms steps
+    while (1) {
+        // Poll substation (train or maintenance overrides)
+        poll_substation_status();
+
+        // Read local inputs (switches, push buttons)
+        read_inputs();
+
+        // If substation signaled "maintenanceOff" and in maintenance, handle it
+        if (remoteMaintenanceOffFlag && (currentState == ST_MAINTENANCE_MODE || currentState == ST_MAINTENANCE_CLOSING)) {
+            xil_printf("[REMOTE] Forcing maintenance off.\n");
+            maintenanceKeySwitch = false;
+            remoteMaintenanceOffFlag = false;
+        }
+
+        // Update the FSM
+        update_fsm();
+
+        // Update outputs (LEDs, servo angles, prints)
+        update_outputs();
+
+        // Sleep 100ms
+        usleep(TICK_PERIOD_MS * 1000);
+    }
+
+    // not expected to exit
+    cleanup_platform();
+    return 0;
+}
+
+/**************************************************************
+ * hardware_init
+ * - Initialize servo, LED, ADC
+ * - Initialize UART0 (WiFly) and UART1 (console)
+ * - Initialize input GPIO
+ **************************************************************/
+static void hardware_init(void)
+{
+    // LED, servo, ADC
+    led_init();
+    servo_init();
+    adc_init();
+
+    // UART1 => console
+    XUartPs_Config *cfg = XUartPs_LookupConfig(XPAR_PS7_UART_1_DEVICE_ID);
+    if (!cfg) {
+        xil_printf("UART1 Lookup failed\n");
+        return;
+    }
+    XUartPs_CfgInitialize(&UartInst1, cfg, cfg->BaseAddress);
+    XUartPs_SetBaudRate(&UartInst1, 115200);
+
+    // UART0 => WiFly
+    cfg = XUartPs_LookupConfig(XPAR_PS7_UART_0_DEVICE_ID);
+    if (!cfg) {
+        xil_printf("UART0 Lookup failed\n");
+        return;
+    }
+    XUartPs_CfgInitialize(&UartInst0, cfg, cfg->BaseAddress);
+    XUartPs_SetBaudRate(&UartInst0, 9600);
+
+    // Local input
+    XGpio_Initialize(&gpioIn, GPIO_IN_DEVICE_ID);
+    XGpio_SetDataDirection(&gpioIn, GPIO_IN_CHANNEL, 0xFFFFFFFF); // all input
+}
+
+/**************************************************************
+ * read_inputs
+ * - Read local switches & push buttons
+ *     0 => train arriving switch
+ *     1 => maintenance key switch
+ *     2 => pedBtn1
+ *     3 => pedBtn2
+ **************************************************************/
+static void read_inputs(void)
+{
+    u32 data = XGpio_DiscreteRead(&gpioIn, GPIO_IN_CHANNEL);
+
+    bool swTrain        = (data & 0x1) ? true : false;
+    bool swMaintenance  = (data & 0x2) ? true : false;
+    pedBtn1            = (data & 0x4) ? true : false;
+    pedBtn2            = (data & 0x8) ? true : false;
+
+    // Combine local switch with remote substation info
+    // If either is set, "train arriving = true"
+    // Reset it after clear
+    trainArrivingSwitch    = trainArrivingSwitch || swTrain;
+    maintenanceKeySwitch   = maintenanceKeySwitch || swMaintenance;
+
+    // Ped request
+    if (pedBtn1 || pedBtn2) {
+        pedRequestFlag = true;
+    }
+}
+
+/* The main state machine transitions */
+static void update_fsm(void)
+{
+    switch (currentState) {
+
+    case ST_TRAFFIC_FLOW:
+        if (trafficFlowCounter == 0) {
+            xil_printf("[FSM] Enter TRAFFIC_FLOW\n");
+        }
+        trafficFlowCounter++;
+
+        // If train arrives
+        if (trainArrivingSwitch) {
+            xil_printf("Train => TRAIN_APPROACH\n");
+            currentState = ST_TRAIN_APPROACH;
+            trafficFlowCounter = 0;
+            break;
+        }
+
+        // If maintenance key
+        if (maintenanceKeySwitch) {
+            xil_printf("Maintenance => MAINTENANCE_CLOSING\n");
+            currentState = ST_MAINTENANCE_CLOSING;
+            trafficFlowCounter = 0;
+            break;
+        }
+
+        // After 10s, if ped request => wait
+        if (trafficFlowCounter >= TRAFFIC_MIN_FLOW_TICKS && pedRequestFlag) {
+            xil_printf("Min Flow done & ped => PEDESTRIAN_WAIT\n");
+            currentState = ST_PEDESTRIAN_WAIT;
+            trafficFlowCounter = 0;
+        }
+        break;
+
+    case ST_PEDESTRIAN_WAIT:
+        // If train arrives
+        if (trainArrivingSwitch) {
+            xil_printf("Train => TRAIN_APPROACH\n");
+            currentState = ST_TRAIN_APPROACH;
+            break;
+        }
+        // If maintenance
+        if (maintenanceKeySwitch) {
+            xil_printf("Maintenance => MAINTENANCE_CLOSING\n");
+            currentState = ST_MAINTENANCE_CLOSING;
+            break;
+        }
+        // else start crossing
+        xil_printf("=> PEDESTRIAN_CROSSING\n");
+        pedestrianCounter = 0;
+        currentState = ST_PEDESTRIAN_CROSSING;
+        break;
+
+    case ST_PEDESTRIAN_CROSSING:
+        if (pedestrianCounter == 0) {
+            xil_printf("[FSM] Ped crossing 10s\n");
+        }
+        pedestrianCounter++;
+
+        if (trainArrivingSwitch) {
+            xil_printf("Train => TRAIN_APPROACH\n");
+            currentState = ST_TRAIN_APPROACH;
+            break;
+        }
+        if (maintenanceKeySwitch) {
+            xil_printf("Maintenance => MAINTENANCE_CLOSING\n");
+            currentState = ST_MAINTENANCE_CLOSING;
+            break;
+        }
+        if (pedestrianCounter >= PEDESTRIAN_TIME_TICKS) {
+            xil_printf("Ped crossing done => TRAFFIC_FLOW\n");
+            currentState = ST_TRAFFIC_FLOW;
+            trafficFlowCounter = 0;
+            pedRequestFlag = false;
+        }
+        break;
+
+    case ST_TRAIN_APPROACH:
+        xil_printf("[FSM] => TRAIN_PASSING (gate down, traffic red)\n");
+        currentState = ST_TRAIN_PASSING;
+        break;
+
+    case ST_TRAIN_PASSING:
+        // Wait for trainArrivingSwitch cleared
+        if (!trainArrivingSwitch) {
+            xil_printf("[FSM] => POST_TRAIN_HOLD (train clear)\n");
+            currentState = ST_POST_TRAIN_HOLD;
+            postTrainCounter = 0;
+        }
+        break;
+
+    case ST_POST_TRAIN_HOLD:
+        postTrainCounter++;
+        if (postTrainCounter >= POST_TRAIN_HOLD_TICKS) {
+            xil_printf("=> TRAFFIC_FLOW\n");
+            currentState = ST_TRAFFIC_FLOW;
+            trafficFlowCounter = 0;
+            pedRequestFlag = false;
+        }
+        break;
+
+    case ST_MAINTENANCE_CLOSING:
+        xil_printf("[FSM] => MAINTENANCE_MODE\n");
+        currentState = ST_MAINTENANCE_MODE;
+        break;
+
+    case ST_MAINTENANCE_MODE:
+        // if the key is turned OFF
+        if (!maintenanceKeySwitch) {
+            xil_printf("[FSM] => MAINTENANCE_EXIT\n");
+            currentState = ST_MAINTENANCE_EXIT;
+        }
+        break;
+
+    case ST_MAINTENANCE_EXIT:
+        xil_printf("[FSM] => TRAFFIC_FLOW\n");
+        currentState = ST_TRAFFIC_FLOW;
+        trafficFlowCounter = 0;
+        pedRequestFlag = false;
+        break;
+    }
+}
+
+/**************************************************************
+ * update_outputs
+ *  - sets LED states, servo position
+ *  - prints status messages if needed
+ **************************************************************/
+static void update_outputs(void)
+{
+    // turn off standard traffic leds
+    led_set(RED,    false);
+    led_set(YELLOW, false);
+    led_set(GREEN,  false);
+
+    switch (currentState) {
+    case ST_TRAFFIC_FLOW:
+        // run the 3-second cycle
+        traffic_light_sequence();
+        servo_set(GATE_UP_ANGLE);
+        break;
+
+    case ST_PEDESTRIAN_WAIT:
+        led_set(RED, true);
+        servo_set(GATE_UP_ANGLE);
+        break;
+
+    case ST_PEDESTRIAN_CROSSING:
+        led_set(RED, true);
+        // Indicate "walk" => turn on GREEN
+        led_set(GREEN, true);
+        servo_set(GATE_UP_ANGLE);
+        break;
+
+    case ST_TRAIN_APPROACH:
+    case ST_TRAIN_PASSING:
+        led_set(RED, true);
+        servo_set(GATE_DOWN_ANGLE);
+        break;
+
+    case ST_POST_TRAIN_HOLD:
+        led_set(RED, true);
+        servo_set(GATE_UP_ANGLE);
+        break;
+
+    case ST_MAINTENANCE_CLOSING:
+        // traffic off, gate down
+        servo_set(GATE_DOWN_ANGLE);
+        break;
+
+    case ST_MAINTENANCE_MODE:
+    {
+        // all standard lights off; flash BLUE
+        // also manual pot to control servo
+        float potVal = adc_get_pot(); // 0..1
+        float angle  = potVal * 90.0f;
+        servo_set(angle);
+
+        blueFlashCounter++;
+        static bool blueOn = false;
+        if (blueFlashCounter >= BLUE_FLASH_HALF_PERIOD) {
+            blueOn = !blueOn;
+            blueFlashCounter = 0;
+        }
+        led_set(BLUE, blueOn);
+
+        xil_printf("[MAINT] pot=%.2f => angle=%.2f\n", potVal, angle);
+    }
+    break;
+
+    case ST_MAINTENANCE_EXIT:
+        servo_set(GATE_UP_ANGLE);
+        led_set(RED, true);
+        break;
+    }
+}
+
+/**************************************************************
+ * traffic_light_sequence
+ *
+ * 3-second cycle repeated:
+ *   0..1s => Red
+ *   1..2s => Yellow
+ *   2..3s => Green
+ **************************************************************/
+static void traffic_light_sequence(void)
+{
+    // each 3s cycle => break into 3 sub-seconds
+    // trafficFlowCounter increments every 0.1 s
+    // one "second" = 10 ticks
+    int cycleLength = 3 * TICKS_PER_SECOND; // 3 seconds
+    int localCount  = trafficFlowCounter % cycleLength;
+    int second      = localCount / TICKS_PER_SECOND; // 0..2
+
+    switch (second) {
+    case 0: // 0..1s
+        led_set(RED, true);
+        break;
+    case 1: // 1..2s
+        led_set(YELLOW, true);
+        break;
+    case 2: // 2..3s
+        led_set(GREEN, true);
+        break;
+    }
+}
+
+/**************************************************************
+ * poll_substation_status
+ *
+ *  - Creates an UPDATE(id=0,value=0) request
+ *  - Sends it over UART0 to the substation
+ *  - Reads the Update_resp_t
+ *  - Extracts values[MY_CROSSING_ID], calls parse_substation_value
+ **************************************************************/
+static void poll_substation_status(void)
+{
+    // Build request
+    Msg_t txMsg;
+    memset(&txMsg, 0, sizeof(Msg_t));
+    txMsg.reqmsg.type  = UPDATE;
+    txMsg.reqmsg.id    = 0;
+    txMsg.reqmsg.value = 0;
+
+    // Send
+    XUartPs_Send(&UartInst0, (u8*)&txMsg.reqmsg, sizeof(Update_req_t));
+
+    // short wait
+    usleep(20000);
+
+    // Attempt read
+    Msg_t rxMsg;
+    memset(&rxMsg, 0, sizeof(rxMsg));
+    int bytesReceived = 0;
+    int needed = sizeof(Update_resp_t);
+
+    while (bytesReceived < needed) {
+        int chunk = XUartPs_Recv(&UartInst0, ((u8*)&rxMsg.respmsg)+bytesReceived, needed - bytesReceived);
+        if (chunk <= 0) break;
+        bytesReceived += chunk;
+    }
+
+    if (bytesReceived == (int)sizeof(Update_resp_t) && rxMsg.respmsg.type == UPDATE) {
+        int val = rxMsg.respmsg.values[MY_CROSSING_ID];
+        parse_substation_value(val);
+    }
+}
+
+/**************************************************************
+ * parse_substation_value
+ * Interprets the substation's "value" for crossing:
+ *   1 => train arriving
+ *   2 => maintenance ON
+ *   3 => maintenance OFF
+ *   else => normal
+ **************************************************************/
+static void parse_substation_value(int val)
+{
+    switch (val) {
+    case 1:
+        trainArrivingSwitch = true;
+        xil_printf("[Substation] Train Arriving\n");
+        break;
+    case 2:
+        maintenanceKeySwitch = true;
+        xil_printf("[Substation] Maintenance ON\n");
+        break;
+    case 3:
+        remoteMaintenanceOffFlag = true;
+        xil_printf("[Substation] Maintenance OFF\n");
+        break;
+    default:
+        // 0 => normal
+        break;
+    }
+}
